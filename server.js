@@ -1,19 +1,235 @@
-const express=require("express"),{Pool}=require("pg"),bcrypt=require("bcryptjs"),jwt=require("jsonwebtoken"),path=require("path");
-const app=express(),PORT=process.env.PORT||10000;
-if(!process.env.DATABASE_URL||!process.env.JWT_SECRET||!process.env.OWNER_EMAIL||!process.env.OWNER_PASSWORD)process.exit(1);
-const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes("localhost")?false:{rejectUnauthorized:false}});
-app.use(express.json());app.use(express.static(path.join(__dirname,"public")));
-async function init(){await pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'student',created_at TIMESTAMPTZ DEFAULT NOW());CREATE TABLE IF NOT EXISTS lectures(id SERIAL PRIMARY KEY,module_no INT NOT NULL,level TEXT NOT NULL,title TEXT NOT NULL,description TEXT DEFAULT '',video_url TEXT DEFAULT '',resource_url TEXT DEFAULT '',created_at TIMESTAMPTZ DEFAULT NOW());`);let h=await bcrypt.hash(process.env.OWNER_PASSWORD,12);await pool.query("INSERT INTO users(email,password_hash,role) VALUES($1,$2,'owner') ON CONFLICT(email) DO UPDATE SET role='owner',password_hash=$2",[process.env.OWNER_EMAIL.toLowerCase(),h])}
-function auth(req,res,next){try{req.user=jwt.verify((req.headers.authorization||"").split(" ")[1],process.env.JWT_SECRET);next()}catch{res.status(401).json({error:"Login required"})}}
-function owner(req,res,next){if(req.user.role!=="owner")return res.status(403).json({error:"Owner only"});next()}
-app.get("/health",async(_,res)=>{try{await pool.query("SELECT 1");res.json({ok:true})}catch{res.status(503).json({ok:false})}});
-app.post("/api/login",async(req,res)=>{let e=String(req.body.email||"").toLowerCase().trim(),p=String(req.body.password||""),q=await pool.query("SELECT * FROM users WHERE email=$1",[e]);if(!q.rowCount||!(await bcrypt.compare(p,q.rows[0].password_hash)))return res.status(401).json({error:"Invalid email or password"});let u=q.rows[0];res.json({token:jwt.sign({id:u.id,email:u.email,role:u.role},process.env.JWT_SECRET,{expiresIn:"7d"}),user:{id:u.id,email:u.email,role:u.role}})});
-app.get("/api/me",auth,(req,res)=>res.json({user:req.user}));
-app.get("/api/lectures",async(_,res)=>res.json({lectures:(await pool.query("SELECT * FROM lectures ORDER BY module_no,id")).rows}));
-app.get("/api/students",auth,owner,async(_,res)=>res.json({students:(await pool.query("SELECT id,email,created_at FROM users WHERE role='student' ORDER BY id DESC")).rows}));
-app.post("/api/students",auth,owner,async(req,res)=>{let e=String(req.body.email||"").toLowerCase().trim(),p=String(req.body.password||"");if(!e||p.length<6)return res.status(400).json({error:"Valid email and 6+ character password required"});try{let h=await bcrypt.hash(p,12),q=await pool.query("INSERT INTO users(email,password_hash,role) VALUES($1,$2,'student') RETURNING id,email,role,created_at",[e,h]);res.status(201).json({user:q.rows[0]})}catch(x){res.status(x.code==="23505"?409:500).json({error:x.code==="23505"?"Email already exists":"Could not create account"})}});
-app.delete("/api/students/:id",auth,owner,async(req,res)=>{await pool.query("DELETE FROM users WHERE id=$1 AND role='student'",[req.params.id]);res.json({ok:true})});
-app.post("/api/lectures",auth,owner,async(req,res)=>{let n=Number(req.body.module_no),t=String(req.body.title||"").trim();if(!Number.isInteger(n)||n<1||!t)return res.status(400).json({error:"Module number and title required"});let q=await pool.query("INSERT INTO lectures(module_no,level,title,description,video_url,resource_url) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[n,String(req.body.level||"Beginner"),t,String(req.body.description||""),String(req.body.video_url||""),String(req.body.resource_url||"")]);res.status(201).json({lecture:q.rows[0]})});
-app.delete("/api/lectures/:id",auth,owner,async(req,res)=>{await pool.query("DELETE FROM lectures WHERE id=$1",[req.params.id]);res.json({ok:true})});
-app.get("*",(_,res)=>res.sendFile(path.join(__dirname,"public/index.html")));
-init().then(()=>app.listen(PORT,"0.0.0.0")).catch(e=>{console.error(e);process.exit(1)});
+const express = require("express");
+const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Validate environment variables
+if (!process.env.DATABASE_URL || !process.env.JWT_SECRET || !process.env.OWNER_EMAIL || !process.env.OWNER_PASSWORD) {
+  console.error("ERROR: Missing required environment variables: DATABASE_URL, JWT_SECRET, OWNER_EMAIL, OWNER_PASSWORD");
+  process.exit(1);
+}
+
+// Database connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+});
+
+// Middleware
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "Public")));
+
+// Initialize database
+async function init() {
+  try {
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'student',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create lectures table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS lectures (
+        id SERIAL PRIMARY KEY,
+        module_no INTEGER NOT NULL,
+        level TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        video_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create owner account if it doesn't exist
+    const ownerExists = await pool.query("SELECT * FROM users WHERE email=$1", [process.env.OWNER_EMAIL]);
+    if (ownerExists.rowCount === 0) {
+      const ownerPasswordHash = await bcrypt.hash(process.env.OWNER_PASSWORD, 10);
+      await pool.query(
+        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3)",
+        [process.env.OWNER_EMAIL, ownerPasswordHash, "owner"]
+      );
+      console.log("✓ Owner account created");
+    }
+  } catch (error) {
+    console.error("Database initialization error:", error);
+    throw error;
+  }
+}
+
+// Authentication middleware
+function auth(req, res, next) {
+  try {
+    const token = (req.headers.authorization || "").split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ error: "Login required" });
+    }
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch (error) {
+    res.status(401).json({ error: "Login required" });
+  }
+}
+
+// Owner-only middleware
+function owner(req, res, next) {
+  if (!req.user || req.user.role !== "owner") {
+    return res.status(403).json({ error: "Owner only" });
+  }
+  next();
+}
+
+// Routes
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(503).json({ ok: false });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").toLowerCase().trim();
+    const password = String(req.body.password || "");
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password required" });
+    }
+
+    const query = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (query.rowCount === 0) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const user = query.rows[0];
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.json({ token });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/me", auth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.get("/api/lectures", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM lectures ORDER BY module_no, id");
+    res.json({ lectures: result.rows });
+  } catch (error) {
+    console.error("Lectures fetch error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/students", auth, owner, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, email, created_at FROM users WHERE role='student' ORDER BY id DESC");
+    res.json({ students: result.rows });
+  } catch (error) {
+    console.error("Students fetch error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/students", auth, owner, async (req, res) => {
+  try {
+    const email = String(req.body.email || "").toLowerCase().trim();
+    const password = String(req.body.password || "");
+
+    if (!email || password.length < 6) {
+      return res.status(400).json({ error: "Valid email and password (min 6 chars) required" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await pool.query(
+      "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3)",
+      [email, passwordHash, "student"]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Student creation error:", error);
+    if (error.message.includes("duplicate")) {
+      return res.status(400).json({ error: "Email already exists" });
+    }
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/api/students/:id", auth, owner, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE id=$1 AND role='student'", [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Student deletion error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/lectures", auth, owner, async (req, res) => {
+  try {
+    const moduleNo = Number(req.body.module_no);
+    const level = String(req.body.level || "").trim();
+    const title = String(req.body.title || "").trim();
+    const description = String(req.body.description || "").trim();
+    const videoUrl = String(req.body.video_url || "").trim();
+
+    if (!Number.isInteger(moduleNo) || moduleNo < 1 || !level || !title) {
+      return res.status(400).json({ error: "Module number, level, and title required" });
+    }
+
+    await pool.query(
+      "INSERT INTO lectures (module_no, level, title, description, video_url) VALUES ($1, $2, $3, $4, $5)",
+      [moduleNo, level, title, description, videoUrl]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Lecture creation error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/api/lectures/:id", auth, owner, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM lectures WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Lecture deletion error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Fallback to index.html for SPA routing
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "Public", "index.html"));
+});
+
+// Start server
+init()
+  .then(() => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`✓ Server running on port ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  });
