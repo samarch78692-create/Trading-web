@@ -1,0 +1,8 @@
+{
+  "name": "TradeSmart Academy",
+  "short_name": "TradeSmart",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050a12",
+  "theme_color": "#07111f"
+}
