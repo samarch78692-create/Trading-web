@@ -2,65 +2,59 @@ const express = require("express");
 const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const path = require("path");
 
 const app = express();
 
-/*
-  IMPORTANT:
-  The hosting platform provides PORT automatically.
-  If it doesn't, 8080 is used as the fallback.
-*/
-const PORT = Number(process.env.PORT) || 8080;
+// Abasthan provides PORT automatically.
+// 10000 is used only as a fallback.
+const PORT = Number(process.env.PORT) || 10000;
 
-/* =========================================================
-   ENVIRONMENT VARIABLES
-========================================================= */
+// Only required environment variable.
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const requiredEnv = [
-  "DATABASE_URL",
-  "JWT_SECRET",
-  "OWNER_EMAIL",
-  "OWNER_PASSWORD"
-];
-
-for (const name of requiredEnv) {
-  if (!process.env[name]) {
-    console.error(`ERROR: Missing environment variable: ${name}`);
-    process.exit(1);
-  }
+if (!DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is missing.");
+  process.exit(1);
 }
 
-/* =========================================================
-   DATABASE
-========================================================= */
+/*
+  JWT secret is generated automatically.
 
+  This means you do NOT need JWT_SECRET in Abasthan.
+  Important: users will need to log in again after a server restart.
+*/
+const JWT_SECRET = crypto.randomBytes(48).toString("hex");
+
+// PostgreSQL / Neon connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes("localhost")
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("localhost")
     ? false
-    : { rejectUnauthorized: false }
+    : { rejectUnauthorized: false },
+
+  // Don't wait forever if Neon is unavailable.
+  connectionTimeoutMillis: 10000,
+
+  // Keep the pool small for a small educational website.
+  max: 5,
+
+  idleTimeoutMillis: 30000
 });
 
 pool.on("error", (error) => {
-  console.error("Unexpected database pool error:", error);
+  console.error("PostgreSQL pool error:", error);
 });
-
-/* =========================================================
-   PATHS
-========================================================= */
 
 const publicPath = path.join(__dirname, "public");
 const indexPath = path.join(publicPath, "index.html");
-
-/* =========================================================
-   MIDDLEWARE
-========================================================= */
 
 app.disable("x-powered-by");
 
 app.use(express.json({ limit: "1mb" }));
 
+// Serve website files
 app.use(
   express.static(publicPath, {
     index: "index.html",
@@ -68,9 +62,15 @@ app.use(
   })
 );
 
-/* =========================================================
-   AUTHENTICATION
-========================================================= */
+// ----------------------------------------------------
+// DATABASE STATE
+// ----------------------------------------------------
+
+let databaseReady = false;
+
+// ----------------------------------------------------
+// AUTHENTICATION
+// ----------------------------------------------------
 
 function auth(req, res, next) {
   try {
@@ -84,10 +84,7 @@ function auth(req, res, next) {
 
     const token = header.substring(7);
 
-    req.user = jwt.verify(
-      token,
-      process.env.JWT_SECRET
-    );
+    req.user = jwt.verify(token, JWT_SECRET);
 
     next();
   } catch (error) {
@@ -107,39 +104,60 @@ function owner(req, res, next) {
   next();
 }
 
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
+function requireDatabase(req, res, next) {
+  if (!databaseReady) {
+    return res.status(503).json({
+      error: "Database is currently unavailable. Please try again shortly."
+    });
+  }
+
+  next();
+}
+
+// ----------------------------------------------------
+// HEALTH CHECK
+// ----------------------------------------------------
 
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
 
+    databaseReady = true;
+
     res.status(200).json({
-      ok: true
+      ok: true,
+      server: true,
+      database: true
     });
   } catch (error) {
-    console.error("Health check failed:", error);
+    databaseReady = false;
+
+    console.error("Health database check failed:", error.message);
 
     res.status(503).json({
-      ok: false
+      ok: false,
+      server: true,
+      database: false
     });
   }
 });
 
-/* =========================================================
-   LOGIN
-========================================================= */
+// Simple server test that DOES NOT require Neon
+app.get("/server-test", (req, res) => {
+  res.status(200).send("TradeSmart server is running.");
+});
 
-app.post("/api/login", async (req, res) => {
+// ----------------------------------------------------
+// LOGIN
+// ----------------------------------------------------
+
+app.post("/api/login", requireDatabase, async (req, res) => {
   try {
-    const email = String(
-      req.body?.email || ""
-    ).toLowerCase().trim();
+    const email = String(req.body?.email || "")
+      .toLowerCase()
+      .trim();
 
-    const password = String(
-      req.body?.password || ""
-    );
+    const password = String(req.body?.password || "");
 
     if (!email || !password) {
       return res.status(400).json({
@@ -177,27 +195,32 @@ app.post("/api/login", async (req, res) => {
         email: user.email,
         role: user.role
       },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       {
         expiresIn: "7d"
       }
     );
 
-    return res.json({
-      token
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role
+      }
     });
   } catch (error) {
     console.error("Login error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       error: "Server error"
     });
   }
 });
 
-/* =========================================================
-   CURRENT USER
-========================================================= */
+// ----------------------------------------------------
+// CURRENT USER
+// ----------------------------------------------------
 
 app.get("/api/me", auth, (req, res) => {
   res.json({
@@ -205,11 +228,11 @@ app.get("/api/me", auth, (req, res) => {
   });
 });
 
-/* =========================================================
-   LECTURES - PUBLIC
-========================================================= */
+// ----------------------------------------------------
+// LECTURES
+// ----------------------------------------------------
 
-app.get("/api/lectures", async (req, res) => {
+app.get("/api/lectures", requireDatabase, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
@@ -236,12 +259,13 @@ app.get("/api/lectures", async (req, res) => {
   }
 });
 
-/* =========================================================
-   STUDENTS - OWNER ONLY
-========================================================= */
+// ----------------------------------------------------
+// STUDENTS
+// ----------------------------------------------------
 
 app.get(
   "/api/students",
+  requireDatabase,
   auth,
   owner,
   async (req, res) => {
@@ -269,23 +293,18 @@ app.get(
   }
 );
 
-/* =========================================================
-   CREATE STUDENT - OWNER ONLY
-========================================================= */
-
 app.post(
   "/api/students",
+  requireDatabase,
   auth,
   owner,
   async (req, res) => {
     try {
-      const email = String(
-        req.body?.email || ""
-      ).toLowerCase().trim();
+      const email = String(req.body?.email || "")
+        .toLowerCase()
+        .trim();
 
-      const password = String(
-        req.body?.password || ""
-      );
+      const password = String(req.body?.password || "");
 
       if (!email || !email.includes("@")) {
         return res.status(400).json({
@@ -299,20 +318,14 @@ app.post(
         });
       }
 
-      const passwordHash = await bcrypt.hash(
-        password,
-        10
-      );
+      const passwordHash = await bcrypt.hash(password, 10);
 
       await pool.query(
         `INSERT INTO users
           (email, password_hash, role)
          VALUES
           ($1, $2, 'student')`,
-        [
-          email,
-          passwordHash
-        ]
+        [email, passwordHash]
       );
 
       res.status(201).json({
@@ -334,12 +347,9 @@ app.post(
   }
 );
 
-/* =========================================================
-   DELETE STUDENT - OWNER ONLY
-========================================================= */
-
 app.delete(
   "/api/students/:id",
+  requireDatabase,
   auth,
   owner,
   async (req, res) => {
@@ -371,19 +381,18 @@ app.delete(
   }
 );
 
-/* =========================================================
-   CREATE LECTURE - OWNER ONLY
-========================================================= */
+// ----------------------------------------------------
+// LECTURE ADMINISTRATION
+// ----------------------------------------------------
 
 app.post(
   "/api/lectures",
+  requireDatabase,
   auth,
   owner,
   async (req, res) => {
     try {
-      const moduleNo = Number(
-        req.body?.module_no
-      );
+      const moduleNo = Number(req.body?.module_no);
 
       const level = String(
         req.body?.level || ""
@@ -401,10 +410,7 @@ app.post(
         req.body?.video_url || ""
       ).trim();
 
-      if (
-        !Number.isInteger(moduleNo) ||
-        moduleNo < 1
-      ) {
+      if (!Number.isInteger(moduleNo) || moduleNo < 1) {
         return res.status(400).json({
           error: "Valid module number required"
         });
@@ -449,12 +455,9 @@ app.post(
   }
 );
 
-/* =========================================================
-   DELETE LECTURE - OWNER ONLY
-========================================================= */
-
 app.delete(
   "/api/lectures/:id",
+  requireDatabase,
   auth,
   owner,
   async (req, res) => {
@@ -485,69 +488,130 @@ app.delete(
   }
 );
 
-/* =========================================================
-   MAIN WEBSITE
-========================================================= */
+// ----------------------------------------------------
+// OWNER SETUP
+// ----------------------------------------------------
 
-app.get("/", (req, res) => {
-  res.sendFile(indexPath, (error) => {
-    if (error) {
-      console.error(
-        "Could not send index.html:",
-        error
-      );
+/*
+  First-owner setup.
 
-      if (!res.headersSent) {
-        res.status(500).send(
-          "Website file could not be loaded. Check that public/index.html exists."
-        );
-      }
+  No OWNER_EMAIL / OWNER_PASSWORD variables are required.
+
+  When the database has no owner, the server generates
+  a temporary setup code and prints it in the deployment logs.
+
+  Use the setup endpoint ONCE to create the owner account.
+
+  After an owner exists, this endpoint becomes disabled.
+*/
+
+let setupCode = null;
+
+function generateSetupCode() {
+  setupCode = crypto.randomBytes(24).toString("hex");
+
+  console.log("");
+  console.log("==============================================");
+  console.log("TRADESMART OWNER SETUP");
+  console.log("==============================================");
+  console.log("Temporary setup code:");
+  console.log(setupCode);
+  console.log("Use it ONCE to create the owner account.");
+  console.log("==============================================");
+  console.log("");
+}
+
+app.post("/api/setup-owner", requireDatabase, async (req, res) => {
+  try {
+    if (!setupCode) {
+      return res.status(403).json({
+        error: "Owner setup is disabled."
+      });
     }
-  });
-});
 
-/* =========================================================
-   API 404
-========================================================= */
+    const suppliedCode = String(
+      req.body?.setup_code || ""
+    );
 
-app.use("/api", (req, res) => {
-  res.status(404).json({
-    error: "API endpoint not found"
-  });
-});
+    if (suppliedCode !== setupCode) {
+      return res.status(403).json({
+        error: "Invalid setup code."
+      });
+    }
 
-/* =========================================================
-   GENERAL 404
-========================================================= */
+    const email = String(
+      req.body?.email || ""
+    )
+      .toLowerCase()
+      .trim();
 
-app.use((req, res) => {
-  res.status(404).send("Page not found");
-});
+    const password = String(
+      req.body?.password || ""
+    );
 
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({
+        error: "Valid owner email required."
+      });
+    }
 
-app.use((error, req, res, next) => {
-  console.error(
-    "Unhandled server error:",
-    error
-  );
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "Owner password must be at least 8 characters."
+      });
+    }
 
-  if (res.headersSent) {
-    return next(error);
+    const existingOwner = await pool.query(
+      `SELECT id FROM users WHERE role='owner' LIMIT 1`
+    );
+
+    if (existingOwner.rowCount > 0) {
+      setupCode = null;
+
+      return res.status(403).json({
+        error: "Owner already exists."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(
+      password,
+      12
+    );
+
+    await pool.query(
+      `INSERT INTO users
+        (email, password_hash, role)
+       VALUES
+        ($1, $2, 'owner')`,
+      [email, passwordHash]
+    );
+
+    setupCode = null;
+
+    console.log(
+      "Owner account successfully created."
+    );
+
+    res.status(201).json({
+      ok: true,
+      message: "Owner account created successfully."
+    });
+  } catch (error) {
+    console.error("Owner setup error:", error);
+
+    res.status(500).json({
+      error: "Server error"
+    });
   }
-
-  res.status(500).json({
-    error: "Internal server error"
-  });
 });
 
-/* =========================================================
-   DATABASE INITIALIZATION
-========================================================= */
+// ----------------------------------------------------
+// DATABASE INITIALIZATION
+// ----------------------------------------------------
 
 async function initDatabase() {
+  console.log("Connecting to PostgreSQL...");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -570,130 +634,161 @@ async function initDatabase() {
     )
   `);
 
-  const ownerEmail =
-    process.env.OWNER_EMAIL
-      .toLowerCase()
-      .trim();
-
-  const ownerResult = await pool.query(
-    "SELECT id FROM users WHERE email=$1",
-    [ownerEmail]
-  );
-
-  if (ownerResult.rowCount === 0) {
-    const passwordHash = await bcrypt.hash(
-      process.env.OWNER_PASSWORD,
-      10
-    );
-
-    await pool.query(
-      `INSERT INTO users
-        (email, password_hash, role)
-       VALUES
-        ($1, $2, 'owner')`,
-      [
-        ownerEmail,
-        passwordHash
-      ]
-    );
-
-    console.log("Owner account created.");
-  } else {
-    console.log("Owner account already exists.");
-  }
+  databaseReady = true;
 
   console.log(
     "Database initialized successfully."
   );
+
+  const ownerResult = await pool.query(
+    `SELECT id FROM users
+     WHERE role='owner'
+     LIMIT 1`
+  );
+
+  if (ownerResult.rowCount === 0) {
+    generateSetupCode();
+  } else {
+    console.log("Owner account already exists.");
+  }
 }
 
-/* =========================================================
-   START SERVER
-========================================================= */
+// ----------------------------------------------------
+// WEBSITE
+// ----------------------------------------------------
 
-async function startServer() {
-  try {
-    await initDatabase();
-
-    const server = app.listen(
-      PORT,
-      "0.0.0.0",
-      () => {
-        console.log(
-          `✓ Server running on port ${PORT}`
-        );
-
-        console.log(
-          `✓ Website directory: ${publicPath}`
-        );
-
-        console.log(
-          "✓ Health check: /health"
-        );
-      }
-    );
-
-    const shutdown = async () => {
-      console.log(
-        "Shutting down server..."
+app.get("/", (req, res) => {
+  res.sendFile(indexPath, (error) => {
+    if (error) {
+      console.error(
+        "Could not send index.html:",
+        error
       );
 
-      server.close(async () => {
-        await pool.end();
-        process.exit(0);
-      });
-    };
+      if (!res.headersSent) {
+        res.status(500).send(
+          "Website file could not be loaded. Check public/index.html."
+        );
+      }
+    }
+  });
+});
 
-    process.on(
-      "SIGTERM",
-      shutdown
-    );
+// ----------------------------------------------------
+// API 404
+// ----------------------------------------------------
 
-    process.on(
-      "SIGINT",
-      shutdown
-    );
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    error: "API endpoint not found"
+  });
+});
 
-  } catch (error) {
-    console.error(
-      "Failed to start server:",
-      error
-    );
+// ----------------------------------------------------
+// PAGE 404
+// ----------------------------------------------------
 
-    await pool
-      .end()
-      .catch(() => {});
+app.use((req, res) => {
+  res.status(404).send(
+    "Page not found"
+  );
+});
 
-    process.exit(1);
+// ----------------------------------------------------
+// ERROR HANDLER
+// ----------------------------------------------------
+
+app.use((error, req, res, next) => {
+  console.error(
+    "Unhandled server error:",
+    error
+  );
+
+  if (res.headersSent) {
+    return next(error);
   }
+
+  res.status(500).json({
+    error: "Internal server error"
+  });
+});
+
+// ----------------------------------------------------
+// START SERVER FIRST
+// ----------------------------------------------------
+
+async function startServer() {
+  const server = app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+      console.log(
+        `✓ TradeSmart server running on port ${PORT}`
+      );
+
+      console.log(
+        `✓ Website directory: ${publicPath}`
+      );
+
+      console.log(
+        "✓ Server test: /server-test"
+      );
+
+      console.log(
+        "✓ Health check: /health"
+      );
+    }
+  );
+
+  // Initialize Neon AFTER the HTTP server has started.
+  try {
+    await initDatabase();
+  } catch (error) {
+    databaseReady = false;
+
+    console.error(
+      "DATABASE INITIALIZATION FAILED:"
+    );
+
+    console.error(error);
+
+    console.error(
+      "The web server is still running, but database features are unavailable."
+    );
+  }
+
+  const shutdown = async () => {
+    console.log(
+      "Shutting down server..."
+    );
+
+    server.close(async () => {
+      await pool.end().catch(() => {});
+
+      process.exit(0);
+    });
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
-/* =========================================================
-   ERROR LOGGING
-========================================================= */
+// ----------------------------------------------------
+// PROCESS ERROR LOGGING
+// ----------------------------------------------------
 
-process.on(
-  "uncaughtException",
-  (error) => {
-    console.error(
-      "UNCAUGHT EXCEPTION:",
-      error
-    );
-  }
-);
+process.on("uncaughtException", (error) => {
+  console.error(
+    "UNCAUGHT EXCEPTION:",
+    error
+  );
+});
 
-process.on(
-  "unhandledRejection",
-  (error) => {
-    console.error(
-      "UNHANDLED REJECTION:",
-      error
-    );
-  }
-);
-
-/* =========================================================
-   START
-========================================================= */
+process.on("unhandledRejection", (error) => {
+  console.error(
+    "UNHANDLED REJECTION:",
+    error
+  );
+});
 
 startServer();
