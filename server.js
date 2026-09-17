@@ -5,22 +5,30 @@ const jwt = require("jsonwebtoken");
 const path = require("path");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-// Validate environment variables
-if (
-  !process.env.DATABASE_URL ||
-  !process.env.JWT_SECRET ||
-  !process.env.OWNER_EMAIL ||
-  !process.env.OWNER_PASSWORD
-) {
-  console.error(
-    "ERROR: Missing required environment variables: DATABASE_URL, JWT_SECRET, OWNER_EMAIL, OWNER_PASSWORD"
-  );
-  process.exit(1);
+/* =========================================================
+   ENVIRONMENT VARIABLES
+========================================================= */
+
+const requiredEnv = [
+  "DATABASE_URL",
+  "JWT_SECRET",
+  "OWNER_EMAIL",
+  "OWNER_PASSWORD"
+];
+
+for (const name of requiredEnv) {
+  if (!process.env[name]) {
+    console.error(`ERROR: Missing environment variable: ${name}`);
+    process.exit(1);
+  }
 }
 
-// Database connection pool
+/* =========================================================
+   DATABASE
+========================================================= */
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL.includes("localhost")
@@ -28,102 +36,117 @@ const pool = new Pool({
     : { rejectUnauthorized: false }
 });
 
-// Middleware
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+pool.on("error", (error) => {
+  console.error("Unexpected database pool error:", error);
+});
 
-// Initialize database
-async function init() {
-  try {
-    // Create users table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'student',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
+/* =========================================================
+   PATHS
+========================================================= */
 
-    // Create lectures table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS lectures (
-        id SERIAL PRIMARY KEY,
-        module_no INTEGER NOT NULL,
-        level TEXT NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT,
-        video_url TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
+const publicPath = path.join(__dirname, "public");
+const indexPath = path.join(publicPath, "index.html");
 
-    // Create owner account if it doesn't exist
-    const ownerExists = await pool.query(
-      "SELECT * FROM users WHERE email=$1",
-      [process.env.OWNER_EMAIL]
-    );
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
 
-    if (ownerExists.rowCount === 0) {
-      const ownerPasswordHash = await bcrypt.hash(
-        process.env.OWNER_PASSWORD,
-        10
-      );
+app.disable("x-powered-by");
 
-      await pool.query(
-        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3)",
-        [process.env.OWNER_EMAIL, ownerPasswordHash, "owner"]
-      );
+app.use(express.json({ limit: "1mb" }));
 
-      console.log("✓ Owner account created");
-    }
-  } catch (error) {
-    console.error("Database initialization error:", error);
-    throw error;
-  }
-}
+/*
+  IMPORTANT:
 
-// Authentication middleware
+  GitHub structure MUST be:
+
+  server.js
+  package.json
+  public/
+    index.html
+
+  "public" is lowercase.
+*/
+
+app.use(
+  express.static(publicPath, {
+    index: "index.html",
+    maxAge: "1h"
+  })
+);
+
+/* =========================================================
+   AUTHENTICATION
+========================================================= */
+
 function auth(req, res, next) {
   try {
-    const token = (req.headers.authorization || "").split(" ")[1];
+    const header = req.headers.authorization || "";
 
-    if (!token) {
-      return res.status(401).json({ error: "Login required" });
+    if (!header.startsWith("Bearer ")) {
+      return res.status(401).json({
+        error: "Login required"
+      });
     }
 
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    const token = header.substring(7);
+
+    req.user = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
     next();
   } catch (error) {
-    res.status(401).json({ error: "Login required" });
+    return res.status(401).json({
+      error: "Login required"
+    });
   }
 }
 
-// Owner-only middleware
 function owner(req, res, next) {
   if (!req.user || req.user.role !== "owner") {
-    return res.status(403).json({ error: "Owner only" });
+    return res.status(403).json({
+      error: "Owner only"
+    });
   }
 
   next();
 }
 
-// Health check
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ ok: true });
+
+    res.status(200).json({
+      ok: true
+    });
   } catch (error) {
-    res.status(503).json({ ok: false });
+    console.error("Health check failed:", error);
+
+    res.status(503).json({
+      ok: false
+    });
   }
 });
 
-// Login
+/* =========================================================
+   LOGIN
+========================================================= */
+
 app.post("/api/login", async (req, res) => {
   try {
-    const email = String(req.body.email || "").toLowerCase().trim();
-    const password = String(req.body.password || "");
+    const email = String(
+      req.body?.email || ""
+    ).toLowerCase().trim();
+
+    const password = String(
+      req.body?.password || ""
+    );
 
     if (!email || !password) {
       return res.status(400).json({
@@ -131,18 +154,18 @@ app.post("/api/login", async (req, res) => {
       });
     }
 
-    const query = await pool.query(
+    const result = await pool.query(
       "SELECT * FROM users WHERE email=$1",
       [email]
     );
 
-    if (query.rowCount === 0) {
+    if (result.rowCount === 0) {
       return res.status(401).json({
         error: "Invalid credentials"
       });
     }
 
-    const user = query.rows[0];
+    const user = result.rows[0];
 
     const passwordMatch = await bcrypt.compare(
       password,
@@ -167,27 +190,45 @@ app.post("/api/login", async (req, res) => {
       }
     );
 
-    res.json({ token });
+    return res.json({
+      token
+    });
   } catch (error) {
     console.error("Login error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       error: "Server error"
     });
   }
 });
 
-// Current user
+/* =========================================================
+   CURRENT USER
+========================================================= */
+
 app.get("/api/me", auth, (req, res) => {
   res.json({
     user: req.user
   });
 });
 
-// Get lectures
+/* =========================================================
+   LECTURES - PUBLIC
+========================================================= */
+
 app.get("/api/lectures", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM lectures ORDER BY module_no, id"
+      `SELECT
+        id,
+        module_no,
+        level,
+        title,
+        description,
+        video_url,
+        created_at
+       FROM lectures
+       ORDER BY module_no ASC, id ASC`
     );
 
     res.json({
@@ -202,161 +243,424 @@ app.get("/api/lectures", async (req, res) => {
   }
 });
 
-// Get students - owner only
-app.get("/api/students", auth, owner, async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT id, email, created_at FROM users WHERE role='student' ORDER BY id DESC"
-    );
+/* =========================================================
+   STUDENTS - OWNER ONLY
+========================================================= */
 
-    res.json({
-      students: result.rows
-    });
-  } catch (error) {
-    console.error("Students fetch error:", error);
+app.get(
+  "/api/students",
+  auth,
+  owner,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT
+          id,
+          email,
+          created_at
+         FROM users
+         WHERE role='student'
+         ORDER BY id DESC`
+      );
 
-    res.status(500).json({
-      error: "Server error"
-    });
-  }
-});
+      res.json({
+        students: result.rows
+      });
+    } catch (error) {
+      console.error("Students fetch error:", error);
 
-// Create student - owner only
-app.post("/api/students", auth, owner, async (req, res) => {
-  try {
-    const email = String(req.body.email || "").toLowerCase().trim();
-    const password = String(req.body.password || "");
-
-    if (!email || password.length < 6) {
-      return res.status(400).json({
-        error: "Valid email and password (min 6 chars) required"
+      res.status(500).json({
+        error: "Server error"
       });
     }
+  }
+);
 
-    const passwordHash = await bcrypt.hash(password, 10);
+/* =========================================================
+   CREATE STUDENT - OWNER ONLY
+========================================================= */
 
-    await pool.query(
-      "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3)",
-      [email, passwordHash, "student"]
-    );
+app.post(
+  "/api/students",
+  auth,
+  owner,
+  async (req, res) => {
+    try {
+      const email = String(
+        req.body?.email || ""
+      ).toLowerCase().trim();
 
-    res.json({
-      ok: true
-    });
-  } catch (error) {
-    console.error("Student creation error:", error);
+      const password = String(
+        req.body?.password || ""
+      );
 
-    if (error.message.includes("duplicate")) {
-      return res.status(400).json({
-        error: "Email already exists"
+      if (!email || !email.includes("@")) {
+        return res.status(400).json({
+          error: "Valid email required"
+        });
+      }
+
+      if (password.length < 6) {
+        return res.status(400).json({
+          error: "Password must be at least 6 characters"
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(
+        password,
+        10
+      );
+
+      await pool.query(
+        `INSERT INTO users
+          (email, password_hash, role)
+         VALUES
+          ($1, $2, 'student')`,
+        [
+          email,
+          passwordHash
+        ]
+      );
+
+      res.status(201).json({
+        ok: true
+      });
+    } catch (error) {
+      console.error("Student creation error:", error);
+
+      if (error.code === "23505") {
+        return res.status(400).json({
+          error: "Email already exists"
+        });
+      }
+
+      res.status(500).json({
+        error: "Server error"
       });
     }
-
-    res.status(500).json({
-      error: "Server error"
-    });
   }
-});
+);
 
-// Delete student - owner only
-app.delete("/api/students/:id", auth, owner, async (req, res) => {
-  try {
-    await pool.query(
-      "DELETE FROM users WHERE id=$1 AND role='student'",
-      [req.params.id]
-    );
+/* =========================================================
+   DELETE STUDENT - OWNER ONLY
+========================================================= */
 
-    res.json({
-      ok: true
-    });
-  } catch (error) {
-    console.error("Student deletion error:", error);
+app.delete(
+  "/api/students/:id",
+  auth,
+  owner,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
 
-    res.status(500).json({
-      error: "Server error"
-    });
-  }
-});
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({
+          error: "Invalid student ID"
+        });
+      }
 
-// Add lecture - owner only
-app.post("/api/lectures", auth, owner, async (req, res) => {
-  try {
-    const moduleNo = Number(req.body.module_no);
-    const level = String(req.body.level || "").trim();
-    const title = String(req.body.title || "").trim();
-    const description = String(req.body.description || "").trim();
-    const videoUrl = String(req.body.video_url || "").trim();
+      await pool.query(
+        `DELETE FROM users
+         WHERE id=$1 AND role='student'`,
+        [id]
+      );
 
-    if (
-      !Number.isInteger(moduleNo) ||
-      moduleNo < 1 ||
-      !level ||
-      !title
-    ) {
-      return res.status(400).json({
-        error: "Module number, level, and title required"
+      res.json({
+        ok: true
+      });
+    } catch (error) {
+      console.error("Student deletion error:", error);
+
+      res.status(500).json({
+        error: "Server error"
       });
     }
-
-    await pool.query(
-      "INSERT INTO lectures (module_no, level, title, description, video_url) VALUES ($1, $2, $3, $4, $5)",
-      [moduleNo, level, title, description, videoUrl]
-    );
-
-    res.json({
-      ok: true
-    });
-  } catch (error) {
-    console.error("Lecture creation error:", error);
-
-    res.status(500).json({
-      error: "Server error"
-    });
   }
-});
+);
 
-// Delete lecture - owner only
-app.delete("/api/lectures/:id", auth, owner, async (req, res) => {
-  try {
-    await pool.query(
-      "DELETE FROM lectures WHERE id=$1",
-      [req.params.id]
-    );
+/* =========================================================
+   CREATE LECTURE - OWNER ONLY
+========================================================= */
 
-    res.json({
-      ok: true
-    });
-  } catch (error) {
-    console.error("Lecture deletion error:", error);
+app.post(
+  "/api/lectures",
+  auth,
+  owner,
+  async (req, res) => {
+    try {
+      const moduleNo = Number(
+        req.body?.module_no
+      );
 
-    res.status(500).json({
-      error: "Server error"
-    });
+      const level = String(
+        req.body?.level || ""
+      ).trim();
+
+      const title = String(
+        req.body?.title || ""
+      ).trim();
+
+      const description = String(
+        req.body?.description || ""
+      ).trim();
+
+      const videoUrl = String(
+        req.body?.video_url || ""
+      ).trim();
+
+      if (
+        !Number.isInteger(moduleNo) ||
+        moduleNo < 1
+      ) {
+        return res.status(400).json({
+          error: "Valid module number required"
+        });
+      }
+
+      if (!level) {
+        return res.status(400).json({
+          error: "Level required"
+        });
+      }
+
+      if (!title) {
+        return res.status(400).json({
+          error: "Lecture title required"
+        });
+      }
+
+      await pool.query(
+        `INSERT INTO lectures
+          (module_no, level, title, description, video_url)
+         VALUES
+          ($1, $2, $3, $4, $5)`,
+        [
+          moduleNo,
+          level,
+          title,
+          description,
+          videoUrl
+        ]
+      );
+
+      res.status(201).json({
+        ok: true
+      });
+    } catch (error) {
+      console.error("Lecture creation error:", error);
+
+      res.status(500).json({
+        error: "Server error"
+      });
+    }
   }
-});
+);
 
-// Serve index.html for the website
+/* =========================================================
+   DELETE LECTURE - OWNER ONLY
+========================================================= */
+
+app.delete(
+  "/api/lectures/:id",
+  auth,
+  owner,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({
+          error: "Invalid lecture ID"
+        });
+      }
+
+      await pool.query(
+        "DELETE FROM lectures WHERE id=$1",
+        [id]
+      );
+
+      res.json({
+        ok: true
+      });
+    } catch (error) {
+      console.error("Lecture deletion error:", error);
+
+      res.status(500).json({
+        error: "Server error"
+      });
+    }
+  }
+);
+
+/* =========================================================
+   MAIN WEBSITE
+========================================================= */
+
+/*
+  Express static middleware above automatically serves:
+
+  /              -> public/index.html
+  /index.html    -> public/index.html
+  /anything.css  -> public/anything.css
+  /anything.js   -> public/anything.js
+  /images/...    -> public/images/...
+*/
+
 app.get("/", (req, res) => {
-  res.sendFile(
-    path.join(__dirname, "public", "index.html")
-  );
-});
+  res.sendFile(indexPath, (error) => {
+    if (error) {
+      console.error("Could not send index.html:", error);
 
-// Fallback for SPA routes
-app.get("*", (req, res) => {
-  res.sendFile(
-    path.join(__dirname, "public", "index.html")
-  );
-});
-
-// Start server
-init()
-  .then(() => {
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`✓ Server running on port ${PORT}`);
-    });
-  })
-  .catch((error) => {
-    console.error("Failed to start server:", error);
-    process.exit(1);
+      if (!res.headersSent) {
+        res.status(500).send(
+          "Website file could not be loaded. Check that public/index.html exists."
+        );
+      }
+    }
   });
+});
+
+/* =========================================================
+   API 404
+========================================================= */
+
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    error: "API endpoint not found"
+  });
+});
+
+/* =========================================================
+   GENERAL 404
+========================================================= */
+
+app.use((req, res) => {
+  res.status(404).send("Page not found");
+});
+
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("Unhandled server error:", error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(500).json({
+    error: "Internal server error"
+  });
+});
+
+/* =========================================================
+   DATABASE INITIALIZATION
+========================================================= */
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'student',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lectures (
+      id SERIAL PRIMARY KEY,
+      module_no INTEGER NOT NULL,
+      level TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      video_url TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  const ownerEmail =
+    process.env.OWNER_EMAIL.toLowerCase().trim();
+
+  const ownerResult = await pool.query(
+    "SELECT id FROM users WHERE email=$1",
+    [ownerEmail]
+  );
+
+  if (ownerResult.rowCount === 0) {
+    const passwordHash = await bcrypt.hash(
+      process.env.OWNER_PASSWORD,
+      10
+    );
+
+    await pool.query(
+      `INSERT INTO users
+        (email, password_hash, role)
+       VALUES
+        ($1, $2, 'owner')`,
+      [
+        ownerEmail,
+        passwordHash
+      ]
+    );
+
+    console.log("Owner account created.");
+  } else {
+    console.log("Owner account already exists.");
+  }
+
+  console.log("Database initialized successfully.");
+}
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+async function startServer() {
+  try {
+    await initDatabase();
+
+    const server = app.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `✓ Server running on port ${PORT}`
+        );
+        console.log(
+          `✓ Website directory: ${publicPath}`
+        );
+        console.log(
+          `✓ Health check: /health`
+        );
+      }
+    );
+
+    /* Graceful shutdown */
+    const shutdown = async () => {
+      console.log("Shutting down server...");
+
+      server.close(async () => {
+        await pool.end();
+        process.exit(0);
+      });
+    };
+
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+
+  } catch (error) {
+    console.error(
+      "Failed to start server:",
+      error
+    );
+
+    await pool.end().catch(() => {});
+
+    process.exit(1);
+  }
+}
+
+startServer();
