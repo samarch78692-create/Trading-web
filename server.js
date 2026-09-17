@@ -5,7 +5,13 @@ const jwt = require("jsonwebtoken");
 const path = require("path");
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+
+/*
+  IMPORTANT:
+  The hosting platform provides PORT automatically.
+  If it doesn't, 8080 is used as the fallback.
+*/
+const PORT = Number(process.env.PORT) || 8080;
 
 /* =========================================================
    ENVIRONMENT VARIABLES
@@ -54,19 +60,6 @@ const indexPath = path.join(publicPath, "index.html");
 app.disable("x-powered-by");
 
 app.use(express.json({ limit: "1mb" }));
-
-/*
-  IMPORTANT:
-
-  GitHub structure MUST be:
-
-  server.js
-  package.json
-  public/
-    index.html
-
-  "public" is lowercase.
-*/
 
 app.use(
   express.static(publicPath, {
@@ -496,20 +489,13 @@ app.delete(
    MAIN WEBSITE
 ========================================================= */
 
-/*
-  Express static middleware above automatically serves:
-
-  /              -> public/index.html
-  /index.html    -> public/index.html
-  /anything.css  -> public/anything.css
-  /anything.js   -> public/anything.js
-  /images/...    -> public/images/...
-*/
-
 app.get("/", (req, res) => {
   res.sendFile(indexPath, (error) => {
     if (error) {
-      console.error("Could not send index.html:", error);
+      console.error(
+        "Could not send index.html:",
+        error
+      );
 
       if (!res.headersSent) {
         res.status(500).send(
@@ -543,7 +529,10 @@ app.use((req, res) => {
 ========================================================= */
 
 app.use((error, req, res, next) => {
-  console.error("Unhandled server error:", error);
+  console.error(
+    "Unhandled server error:",
+    error
+  );
 
   if (res.headersSent) {
     return next(error);
@@ -582,7 +571,9 @@ async function initDatabase() {
   `);
 
   const ownerEmail =
-    process.env.OWNER_EMAIL.toLowerCase().trim();
+    process.env.OWNER_EMAIL
+      .toLowerCase()
+      .trim();
 
   const ownerResult = await pool.query(
     "SELECT id FROM users WHERE email=$1",
@@ -611,7 +602,9 @@ async function initDatabase() {
     console.log("Owner account already exists.");
   }
 
-  console.log("Database initialized successfully.");
+  console.log(
+    "Database initialized successfully."
+  );
 }
 
 /* =========================================================
@@ -629,18 +622,21 @@ async function startServer() {
         console.log(
           `✓ Server running on port ${PORT}`
         );
+
         console.log(
           `✓ Website directory: ${publicPath}`
         );
+
         console.log(
-          `✓ Health check: /health`
+          "✓ Health check: /health"
         );
       }
     );
 
-    /* Graceful shutdown */
     const shutdown = async () => {
-      console.log("Shutting down server...");
+      console.log(
+        "Shutting down server..."
+      );
 
       server.close(async () => {
         await pool.end();
@@ -648,8 +644,15 @@ async function startServer() {
       });
     };
 
-    process.on("SIGTERM", shutdown);
-    process.on("SIGINT", shutdown);
+    process.on(
+      "SIGTERM",
+      shutdown
+    );
+
+    process.on(
+      "SIGINT",
+      shutdown
+    );
 
   } catch (error) {
     console.error(
@@ -657,18 +660,40 @@ async function startServer() {
       error
     );
 
-    await pool.end().catch(() => {});
+    await pool
+      .end()
+      .catch(() => {});
 
     process.exit(1);
   }
 }
 
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT EXCEPTION:", err);
-});
+/* =========================================================
+   ERROR LOGGING
+========================================================= */
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED REJECTION:", err);
-});
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "UNCAUGHT EXCEPTION:",
+      error
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+    console.error(
+      "UNHANDLED REJECTION:",
+      error
+    );
+  }
+);
+
+/* =========================================================
+   START
+========================================================= */
 
 startServer();
